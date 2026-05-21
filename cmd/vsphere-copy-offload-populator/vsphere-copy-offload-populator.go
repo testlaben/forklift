@@ -187,7 +187,9 @@ func main() {
 		klog.Fatalf("Failed to initialize populator: %s", err)
 	}
 
-	pv, err := getPv(clientSet, targetNamespace, ownerName)
+	// Target LUN name (PV volumeHandle) comes from prime-{uid} once Bound. The populate pod
+	// does not mount prime (see populator-machinery controller_vsphere_xcopy.go), so poll here.
+	pv, err := waitGetPv(clientSet, targetNamespace, ownerName, 10*time.Minute)
 	if err != nil {
 		klog.Fatalf("Failed to fetch the volume handle details from the target pvc %s: %s", ownerName, err)
 	}
@@ -299,6 +301,23 @@ func newKubeClient(masterURL string, kubeconfig string) (*kubernetes.Clientset, 
 	coreCfg := rest.CopyConfig(cfg)
 	coreCfg.ContentType = runtime.ContentTypeProtobuf
 	return kubernetes.NewForConfig(coreCfg)
+}
+
+// waitGetPv polls getPv until the user or prime PVC is Bound and its PV volumeHandle is available.
+// vSphere XCOPY creates prime before the populate pod; the user PVC is often still unbound at pod start.
+func waitGetPv(kubeClient *kubernetes.Clientset, targetNamespace, targetPVC string, timeout time.Duration) (populator.PersistentVolume, error) {
+	deadline := time.Now().Add(timeout)
+	for {
+		pv, err := getPv(kubeClient, targetNamespace, targetPVC)
+		if err == nil {
+			return pv, nil
+		}
+		if time.Now().After(deadline) {
+			return populator.PersistentVolume{}, err
+		}
+		klog.Infof("waiting for prime PVC to bind for %q: %v", targetPVC, err)
+		time.Sleep(2 * time.Second)
+	}
 }
 
 // getPv extract the volume handle from the PVC. To detect the volume of the said targetPVC we need

@@ -338,6 +338,12 @@ func (c *controller) addNotification(keyToCall, objType, namespace, name string)
 	s.set[key] = empty{}
 }
 
+// requeuePVC re-adds a PVC key after delay. Used when sync returns early (e.g. prime
+// just created) because a nil return otherwise Forget()s the workqueue entry.
+func (c *controller) requeuePVC(key string, delay time.Duration) {
+	c.workqueue.AddAfter(key, delay)
+}
+
 func (c *controller) cleanupNotifications(keyToCall string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -604,6 +610,10 @@ func (c *controller) syncPvc(ctx context.Context, key, pvcNamespace, pvcName str
 
 		// If the pod doesn't exist yet, create it
 		if pod == nil {
+			if ready, err := c.ensureVSphereXcopyPrimeReady(ctx, key, pvc, pvcPrime, pvcPrimeName, populatorNamespace, waitForFirstConsumer, nodeName); err != nil || !ready {
+				return err
+			}
+
 			transferNetwork, found, err := unstructured.NestedStringMap(crInstance.Object, "spec", "transferNetwork")
 			if err != nil {
 				return err
@@ -622,6 +632,13 @@ func (c *controller) syncPvc(ctx context.Context, key, pvcNamespace, pvcName str
 				labels["migration"] = migration
 			}
 
+			var podSpec corev1.PodSpec
+			if c.populatorPodReferencesPrimeVolume() {
+				podSpec = makePopulatePodSpec(pvcPrimeName, secretName)
+			} else {
+				podSpec = makePopulatePodSpecNoPrimeVolume(secretName)
+			}
+
 			// Make the pod
 			pod = &corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{
@@ -638,33 +655,37 @@ func (c *controller) syncPvc(ctx context.Context, key, pvcNamespace, pvcName str
 						},
 					},
 				},
-				Spec: makePopulatePodSpec(pvcPrimeName, secretName),
+				Spec: podSpec,
 			}
 			if c.gk.Kind == api.VSphereXcopyVolumePopulatorKind {
 				pod.Spec.ServiceAccountName = "populator" // Xcopy always uses its dedicated SA
 			} else if sa, ok := pvc.Annotations[AnnPopulatorServiceAccount]; ok && sa != "" {
 				pod.Spec.ServiceAccountName = sa // Other populators use the annotation
 			}
-			pod.Spec.Volumes[0].VolumeSource.PersistentVolumeClaim.ClaimName = pvcPrimeName
+			if c.populatorPodReferencesPrimeVolume() {
+				pod.Spec.Volumes[0].VolumeSource.PersistentVolumeClaim.ClaimName = pvcPrimeName
+			}
 			con := &pod.Spec.Containers[0]
 			con.Image = c.imageName
 			con.Args = args
 			if c.resources != nil {
 				con.Resources = *c.resources
 			}
-			if rawBlock {
-				con.VolumeDevices = []corev1.VolumeDevice{
-					{
-						Name:       populatorPodVolumeName,
-						DevicePath: c.devicePath,
-					},
-				}
-			} else {
-				con.VolumeMounts = []corev1.VolumeMount{
-					{
-						Name:      populatorPodVolumeName,
-						MountPath: c.mountPath,
-					},
+			if c.populatorMountsPrimeVolume() {
+				if rawBlock {
+					con.VolumeDevices = []corev1.VolumeDevice{
+						{
+							Name:       populatorPodVolumeName,
+							DevicePath: c.devicePath,
+						},
+					}
+				} else {
+					con.VolumeMounts = []corev1.VolumeMount{
+						{
+							Name:      populatorPodVolumeName,
+							MountPath: c.mountPath,
+						},
+					}
 				}
 			}
 
@@ -678,36 +699,9 @@ func (c *controller) syncPvc(ctx context.Context, key, pvcNamespace, pvcName str
 			}
 			c.recorder.Eventf(pvc, corev1.EventTypeNormal, reasonPodCreationSuccess, "Populator started")
 
-			// If PVC' doesn't exist yet, create it
+			// If PVC' doesn't exist yet, create it (non-xcopy populators create pod first)
 			if pvcPrime == nil {
-				pvcPrime = &corev1.PersistentVolumeClaim{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      pvcPrimeName,
-						Namespace: populatorNamespace,
-						OwnerReferences: []metav1.OwnerReference{
-							{
-								APIVersion: "v1",
-								Kind:       "PersistentVolumeClaim",
-								Name:       pvc.Name,
-								UID:        pvc.UID,
-							},
-						},
-					},
-					Spec: corev1.PersistentVolumeClaimSpec{
-						AccessModes:      pvc.Spec.AccessModes,
-						Resources:        pvc.Spec.Resources,
-						StorageClassName: pvc.Spec.StorageClassName,
-						VolumeMode:       pvc.Spec.VolumeMode,
-					},
-				}
-				if waitForFirstConsumer {
-					pvcPrime.Annotations = map[string]string{
-						annSelectedNode: nodeName,
-					}
-				}
-				_, err = c.kubeClient.CoreV1().PersistentVolumeClaims(populatorNamespace).Create(ctx, pvcPrime, metav1.CreateOptions{})
-				if err != nil {
-					c.recorder.Eventf(pvc, corev1.EventTypeWarning, reasonPVCCreationError, "Failed to create populator PVC: %s", err)
+				if err = c.createPrimePVC(ctx, pvc, pvcPrimeName, populatorNamespace, waitForFirstConsumer, nodeName); err != nil {
 					return err
 				}
 			}

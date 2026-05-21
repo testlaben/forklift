@@ -886,6 +886,10 @@ func (p *Primera3ParClientWsImpl) CopyVolume(sourceVolName string, destVolName s
 		return fmt.Errorf("failed to promote snapshot: %w", err)
 	}
 
+	// Primera-only: VVolCopy and RDMCopy both use CopyVolume (rename/snapshot/promote).
+	// SCSI xcopy (VIB/SSH) uses remote_esxcli and never reaches this function.
+	// Drop VLUN exports for the renamed-aside empty volume before delete.
+	p.unmapVolumeFromAllHosts(tempName)
 	if err := p.deleteVolume(tempName); err != nil {
 		klog.Warningf("Failed to delete old volume %s (non-fatal): %v", tempName, err)
 	}
@@ -1012,6 +1016,25 @@ func (p *Primera3ParClientWsImpl) verifyTaskRunning(taskID int) error {
 		return fmt.Errorf("task %d has unexpected status %d (name: %s)", taskID, t.Status, t.Name)
 	}
 	return nil
+}
+
+// unmapVolumeFromAllHosts removes VLUN exports for volumeName so deleteVolume does not
+// fail with "resource in use" and hosts do not retain stale paths to renamed-aside volumes.
+func (p *Primera3ParClientWsImpl) unmapVolumeFromAllHosts(volumeName string) {
+	hosts, err := p.CurrentMappedGroups(volumeName, nil)
+	if err != nil {
+		klog.Warningf("failed to list VLUN hosts for volume %s before delete: %v", volumeName, err)
+		return
+	}
+	for _, hostname := range hosts {
+		group := hostname
+		if strings.HasPrefix(hostname, "set:") {
+			group = strings.TrimPrefix(hostname, "set:")
+		}
+		if err := p.LunUnmap(context.Background(), group, volumeName); err != nil {
+			klog.Warningf("failed to unmap volume %s from host %s: %v", volumeName, hostname, err)
+		}
+	}
 }
 
 func (p *Primera3ParClientWsImpl) GetSystemInfo() (SystemInfo, error) {
